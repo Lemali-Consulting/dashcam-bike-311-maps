@@ -1,0 +1,12 @@
+# Dev artifacts — not shipped, not tracked
+*.png
+.playwright-mcp/
+
+# Raw OSM dump used to regenerate public/pgh-bike-infra.geojson — keep locally
+# but no need to commit (regenerable via the Overpass query in roadmap notes).
+pgh-bike-osm.json
+
+# Local
+.DS_Store
+.netlify/
+node_modules/

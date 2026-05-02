@@ -1,0 +1,16 @@
+[build]
+  publish = "public"
+
+# Long cache on the static GeoJSON since the file content changes infrequently
+# and a fresh deploy will invalidate it. If you want shorter caches during
+# active iteration, drop max-age to 3600.
+[[headers]]
+  for = "/*.geojson"
+  [headers.values]
+    Cache-Control = "public, max-age=86400, must-revalidate"
+    Content-Type = "application/geo+json"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=300, must-revalidate"
