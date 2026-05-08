@@ -61,6 +61,27 @@
   .clear-btn { background: none; color: var(--accent); border: 1px solid var(--accent);
     padding: 3px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; }
   .clear-btn:disabled { color: var(--ink-dim); border-color: var(--grid-line); cursor: default; }
+  .date-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; font-size: 12px; }
+  .date-controls input[type="date"] { background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--grid-line); border-radius: 4px; padding: 4px 6px;
+    font: inherit; flex: 1; min-width: 0; color-scheme: dark; }
+  .range-slider { position: relative; height: 24px; margin: 0 6px 8px; }
+  .range-slider::before { content: ""; position: absolute; top: 11px; left: 0; right: 0;
+    height: 3px; background: var(--panel-2); border-radius: 2px; }
+  .range-slider .track { position: absolute; top: 11px; height: 3px;
+    background: var(--accent); border-radius: 2px; pointer-events: none; }
+  .range-slider input[type="range"] { position: absolute; top: 0; left: 0; width: 100%;
+    height: 24px; margin: 0; pointer-events: none; -webkit-appearance: none;
+    appearance: none; background: transparent; }
+  .range-slider input[type="range"]::-webkit-slider-thumb { pointer-events: auto;
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer; border: 2px solid var(--panel);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.5); }
+  .range-slider input[type="range"]::-moz-range-thumb { pointer-events: auto;
+    width: 14px; height: 14px; border-radius: 50%; background: var(--accent);
+    cursor: pointer; border: 2px solid var(--panel);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.5); }
+  .range-slider input[type="range"]::-moz-range-track { background: transparent; border: 0; }
   /* Leaflet popup styling */
   .leaflet-popup-content-wrapper { background: var(--panel); color: var(--ink);
     border-radius: 8px; }
@@ -109,6 +130,18 @@
 
     <h2>Hazard type</h2>
     <div class="chips" id="type-chips"></div>
+
+    <h2>Date range</h2>
+    <div class="date-controls">
+      <input type="date" id="date-from" />
+      <span style="color:var(--ink-dim)">→</span>
+      <input type="date" id="date-to" />
+    </div>
+    <div class="range-slider" id="range-slider">
+      <div class="track"></div>
+      <input type="range" id="range-from" />
+      <input type="range" id="range-to" />
+    </div>
 
     <h2>When do hazards happen?</h2>
     <div class="controls">
@@ -186,7 +219,15 @@ const state = {
   brushedCells: new Set(),    // "dow,hour" strings; empty = all
   hideSingletons: false,
   showInfra: false,
+  dateFromDay: null,          // selected lower bound (days since epoch UTC)
+  dateToDay: null,            // selected upper bound (inclusive)
 };
+const dateBounds = { minDay: 0, maxDay: 0 };  // full-dataset range
+const DAY_S = 86400;
+const dayFromTs = ts => Math.floor(ts / DAY_S);
+const dayToISO = day => new Date(day * DAY_S * 1000).toISOString().slice(0, 10);
+const isoToDay = iso => Math.floor(Date.UTC(
+  +iso.slice(0,4), +iso.slice(5,7) - 1, +iso.slice(8,10)) / 1000 / DAY_S);
 
 const map = L.map("map", { zoomControl: true, preferCanvas: true, minZoom: 11, maxZoom: 19 })
   .setView([40.4406, -79.9959], 12);
@@ -233,6 +274,7 @@ fetch(GEOJSON_URL).then(r => r.json()).then(geo => {
     f.geometry && f.geometry.coordinates && f.properties);
   document.querySelector("#map .loading")?.remove();
   initTypeChips();
+  initDateRange();
   initHeatmap();
   render();
 }).catch(err => {
@@ -280,10 +322,19 @@ function normalizeType(name) {
 }
 
 // --- Filtering ---
+function passesType(p) {
+  return state.activeTypes.size === 0 || state.activeTypes.has(normalizeType(p.HazardName));
+}
+function passesDate(p) {
+  if (state.dateFromDay == null) return true;
+  const d = dayFromTs(p.Timestamp);
+  return d >= state.dateFromDay && d <= state.dateToDay;
+}
 function filteredFeatures() {
   return state.features.filter(f => {
     const p = f.properties;
-    if (state.activeTypes.size > 0 && !state.activeTypes.has(normalizeType(p.HazardName))) return false;
+    if (!passesType(p)) return false;
+    if (!passesDate(p)) return false;
     if (state.brushedCells.size > 0) {
       const key = `${p.DayOfWeek},${p.Hour}`;
       if (!state.brushedCells.has(key)) return false;
@@ -491,7 +542,7 @@ function renderHeatmap() {
   // Recompute counts from features, ignoring brush filter (so user can see the full
   // distribution for the active hazard type while brushing into a window).
   const typeFiltered = state.features.filter(f =>
-    state.activeTypes.size === 0 || state.activeTypes.has(normalizeType(f.properties.HazardName)));
+    passesType(f.properties) && passesDate(f.properties));
   const grid = Array.from({ length: 7 }, () => Array(24).fill(0));
   let max = 0;
   for (const f of typeFiltered) {
@@ -567,6 +618,88 @@ function toggleCell(k, mode) {
     document.getElementById("brush-clear").disabled = state.brushedCells.size === 0;
     render();
   }
+}
+
+// --- Date range filter (synced date inputs + dual-handle slider) ---
+function initDateRange() {
+  let mn = Infinity, mx = -Infinity;
+  for (const f of state.features) {
+    const ts = f.properties.Timestamp;
+    if (typeof ts !== "number") continue;
+    if (ts < mn) mn = ts;
+    if (ts > mx) mx = ts;
+  }
+  if (!isFinite(mn)) return;
+  dateBounds.minDay = dayFromTs(mn);
+  dateBounds.maxDay = dayFromTs(mx);
+  state.dateFromDay = dateBounds.minDay;
+  state.dateToDay = dateBounds.maxDay;
+
+  const dateFrom = document.getElementById("date-from");
+  const dateTo = document.getElementById("date-to");
+  const rangeFrom = document.getElementById("range-from");
+  const rangeTo = document.getElementById("range-to");
+
+  const minISO = dayToISO(dateBounds.minDay);
+  const maxISO = dayToISO(dateBounds.maxDay);
+  dateFrom.min = dateTo.min = minISO;
+  dateFrom.max = dateTo.max = maxISO;
+  dateFrom.value = minISO;
+  dateTo.value = maxISO;
+
+  rangeFrom.min = rangeTo.min = String(dateBounds.minDay);
+  rangeFrom.max = rangeTo.max = String(dateBounds.maxDay);
+  rangeFrom.value = String(dateBounds.minDay);
+  rangeTo.value = String(dateBounds.maxDay);
+
+  syncTrack();
+
+  rangeFrom.oninput = () => {
+    let v = +rangeFrom.value;
+    if (v > state.dateToDay) { v = state.dateToDay; rangeFrom.value = v; }
+    state.dateFromDay = v;
+    dateFrom.value = dayToISO(v);
+    syncTrack();
+    render();
+  };
+  rangeTo.oninput = () => {
+    let v = +rangeTo.value;
+    if (v < state.dateFromDay) { v = state.dateFromDay; rangeTo.value = v; }
+    state.dateToDay = v;
+    dateTo.value = dayToISO(v);
+    syncTrack();
+    render();
+  };
+  dateFrom.onchange = () => {
+    if (!dateFrom.value) return;
+    let d = isoToDay(dateFrom.value);
+    d = Math.max(dateBounds.minDay, Math.min(state.dateToDay, d));
+    state.dateFromDay = d;
+    dateFrom.value = dayToISO(d);
+    rangeFrom.value = String(d);
+    syncTrack();
+    render();
+  };
+  dateTo.onchange = () => {
+    if (!dateTo.value) return;
+    let d = isoToDay(dateTo.value);
+    d = Math.min(dateBounds.maxDay, Math.max(state.dateFromDay, d));
+    state.dateToDay = d;
+    dateTo.value = dayToISO(d);
+    rangeTo.value = String(d);
+    syncTrack();
+    render();
+  };
+}
+
+function syncTrack() {
+  const track = document.querySelector("#range-slider .track");
+  if (!track) return;
+  const span = dateBounds.maxDay - dateBounds.minDay || 1;
+  const left = ((state.dateFromDay - dateBounds.minDay) / span) * 100;
+  const right = ((state.dateToDay - dateBounds.minDay) / span) * 100;
+  track.style.left = left + "%";
+  track.style.width = Math.max(0, right - left) + "%";
 }
 
 // --- Misc ---
