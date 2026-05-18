@@ -168,13 +168,13 @@
     <div class="photo-grid" id="photo-grid"></div>
 
     <h2 style="margin-top:24px">About</h2>
-    <p class="sub">Locations are snapped to a ~11m grid. "Repeat offenders" are spots with 3+ reports — these are the places worth fixing. Time data covers Apr 2022 – Apr 2026.</p>
+    <p class="sub">Locations are snapped to a ~11m grid. "Repeat offenders" are spots with 3+ reports — these are the places worth fixing. <span id="data-range">Time data covers the full report history.</span></p>
   </aside>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-const GEOJSON_URL = "AggregatedHazards_pittsburgh.geojson";
+const GEOJSON_URL = "https://dashcamprod.b-cdn.net/o/AggregatedHazards%2Fpittsburgh.geojson?alt=media";
 const INFRA_URL = "pgh-bike-infra.geojson";
 const CDN_BASE = "https://dashcamprod.b-cdn.net/o/";
 
@@ -242,36 +242,130 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
 const markerLayer = L.layerGroup().addTo(map);
 const infraLayer = L.layerGroup();
 let infraLoaded = false;
+let infraGeo = null;   // raw bike-infra geojson, shared by the overlay and enrichment
+
+function drawInfra(geo) {
+  // Render in priority order so high-quality infra draws on top.
+  const order = ["signed", "shared", "painted", "buffered", "protected"];
+  const byClass = {};
+  for (const f of geo.features) {
+    const c = f.properties.class;
+    (byClass[c] = byClass[c] || []).push(f);
+  }
+  for (const c of order) {
+    for (const f of byClass[c] || []) {
+      const latlngs = f.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+      L.polyline(latlngs, {
+        color: INFRA_COLOR[c],
+        weight: c === "protected" ? 3 : 2,
+        opacity: 0.85,
+        dashArray: c === "shared" || c === "signed" ? "4 4" : null,
+      }).addTo(infraLayer);
+    }
+  }
+}
 
 function loadInfra() {
   if (infraLoaded) return Promise.resolve();
   infraLoaded = true;
+  // Infra geojson is normally fetched at startup; fetch on demand if not.
+  if (infraGeo) { drawInfra(infraGeo); return Promise.resolve(); }
   return fetch(INFRA_URL).then(r => r.json()).then(geo => {
-    // Render in priority order so high-quality infra draws on top.
-    const order = ["signed", "shared", "painted", "buffered", "protected"];
-    const byClass = {};
-    for (const f of geo.features) {
-      const c = f.properties.class;
-      (byClass[c] = byClass[c] || []).push(f);
-    }
-    for (const c of order) {
-      for (const f of byClass[c] || []) {
-        const latlngs = f.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
-        L.polyline(latlngs, {
-          color: INFRA_COLOR[c],
-          weight: c === "protected" ? 3 : 2,
-          opacity: 0.85,
-          dashArray: c === "shared" || c === "signed" ? "4 4" : null,
-        }).addTo(infraLayer);
-      }
-    }
+    infraGeo = geo;
+    drawInfra(geo);
   });
 }
 
+// --- Infrastructure enrichment (snap each hazard to nearest bike infra) ---
+// The static geojson used to carry InfraClass / InfraDistM from a build step;
+// the live CDN feed does not, so we recompute it in the browser on load.
+const INFRA_SNAP_M = 25;            // search radius — matches the sidebar copy
+const ENRICH_CELL_M = INFRA_SNAP_M; // grid cell == radius -> a 1-ring search is exact
+const M_PER_DEG_LAT = 111320;
+const M_PER_DEG_LON = 111320 * Math.cos(40.4406 * Math.PI / 180);
+const projX = lon => lon * M_PER_DEG_LON;
+const projY = lat => lat * M_PER_DEG_LAT;
+
+// Squared distance (m²) from a point to a segment, all in projected meters.
+function distToSeg2(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const ex = px - (ax + t * dx), ey = py - (ay + t * dy);
+  return ex * ex + ey * ey;
+}
+
+// Bucket every infra segment into a 25m grid so each hazard only tests the
+// segments in its own cell + 8 neighbours instead of all ~20k.
+function buildInfraIndex(geo) {
+  const grid = new Map();
+  for (const f of geo.features) {
+    const cls = f.properties.class;
+    const co = f.geometry.coordinates;
+    for (let i = 0; i + 1 < co.length; i++) {
+      const seg = {
+        ax: projX(co[i][0]),     ay: projY(co[i][1]),
+        bx: projX(co[i + 1][0]), by: projY(co[i + 1][1]), cls,
+      };
+      const minCx = Math.floor(Math.min(seg.ax, seg.bx) / ENRICH_CELL_M);
+      const maxCx = Math.floor(Math.max(seg.ax, seg.bx) / ENRICH_CELL_M);
+      const minCy = Math.floor(Math.min(seg.ay, seg.by) / ENRICH_CELL_M);
+      const maxCy = Math.floor(Math.max(seg.ay, seg.by) / ENRICH_CELL_M);
+      for (let cx = minCx; cx <= maxCx; cx++) {
+        for (let cy = minCy; cy <= maxCy; cy++) {
+          const key = cx + "," + cy;
+          const arr = grid.get(key);
+          if (arr) arr.push(seg); else grid.set(key, [seg]);
+        }
+      }
+    }
+  }
+  return grid;
+}
+
+// Assigns InfraClass / InfraDistM to each feature in place.
+function enrichInfra(features, geo) {
+  const grid = buildInfraIndex(geo);
+  const snap2 = INFRA_SNAP_M * INFRA_SNAP_M;
+  for (const f of features) {
+    const px = projX(f.geometry.coordinates[0]);
+    const py = projY(f.geometry.coordinates[1]);
+    const cx0 = Math.floor(px / ENRICH_CELL_M);
+    const cy0 = Math.floor(py / ENRICH_CELL_M);
+    let best = Infinity, bestCls = null;
+    for (let cx = cx0 - 1; cx <= cx0 + 1; cx++) {
+      for (let cy = cy0 - 1; cy <= cy0 + 1; cy++) {
+        const arr = grid.get(cx + "," + cy);
+        if (!arr) continue;
+        for (const s of arr) {
+          const d2 = distToSeg2(px, py, s.ax, s.ay, s.bx, s.by);
+          if (d2 < best) { best = d2; bestCls = s.cls; }
+        }
+      }
+    }
+    if (bestCls && best <= snap2) {
+      f.properties.InfraClass = bestCls;
+      f.properties.InfraDistM = Math.round(Math.sqrt(best) * 10) / 10;
+    } else {
+      f.properties.InfraClass = "none";
+    }
+  }
+}
+
 // --- Load data ---
-fetch(GEOJSON_URL).then(r => r.json()).then(geo => {
+// Hazards come from the live CDN feed; infra is local. A failed infra fetch
+// degrades gracefully (no enrichment) rather than breaking the whole map.
+Promise.all([
+  fetch(GEOJSON_URL).then(r => r.json()),
+  fetch(INFRA_URL).then(r => r.json()).catch(() => null),
+]).then(([geo, infra]) => {
   state.features = geo.features.filter(f =>
     f.geometry && f.geometry.coordinates && f.properties);
+  if (infra) {
+    infraGeo = infra;
+    enrichInfra(state.features, infra);
+  }
   document.querySelector("#map .loading")?.remove();
   initTypeChips();
   initDateRange();
@@ -634,6 +728,12 @@ function initDateRange() {
   dateBounds.maxDay = dayFromTs(mx);
   state.dateFromDay = dateBounds.minDay;
   state.dateToDay = dateBounds.maxDay;
+
+  const monthYear = ts => new Date(ts * 1000).toLocaleDateString("en-US", {
+    month: "short", year: "numeric", timeZone: "UTC" });
+  const rangeEl = document.getElementById("data-range");
+  if (rangeEl) rangeEl.textContent =
+    `Time data covers ${monthYear(mn)} – ${monthYear(mx)}.`;
 
   const dateFrom = document.getElementById("date-from");
   const dateTo = document.getElementById("date-to");
